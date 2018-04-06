@@ -1,16 +1,17 @@
 #pragma once
 
-
 #include <cstddef>
 #include <vector>
 #include <algorithm>
 #include <utility>
 #include <limits>
-#include <dlib/svm.h>
 
+#include <dlib/serialize.h>
+#include <dlib/svm.h>
 
 #include "time_axis.h"
 #include "time_series.h"
+
 
 namespace shyft {
 namespace prediction {
@@ -34,7 +35,7 @@ public:  // static/type api
 private:
     core::utctimespan _dt;
     dlib::krls<dlib::radial_basis_kernel<dlib::matrix<double, 1, 1>>> _krls = dlib::krls<kernel_type>{ kernel_type{} };
-    ts::ts_point_fx train_point_fx=ts::ts_point_fx::POINT_AVERAGE_VALUE;
+    ts::ts_point_fx _predicted_point_fx = ts::ts_point_fx::POINT_AVERAGE_VALUE;
 public:  // con-/de-struction, move & copy
     krls_rbf_predictor() = default;
     // -----
@@ -44,22 +45,29 @@ public:  // con-/de-struction, move & copy
         const core::utctimespan dt,
         const scalar_type radial_kernel_gamma,
         const scalar_type tolerance,
-        std::size_t max_dict_size = 1000000u
-    ) : krls_rbf_predictor{ kernel_type{ radial_kernel_gamma }, dt, tolerance, max_dict_size } { }
+        const std::size_t max_dict_size = 1000000u,
+        const ts::ts_point_fx predicted_point_fx = ts::ts_point_fx::POINT_AVERAGE_VALUE
+    ) : krls_rbf_predictor{ kernel_type{ radial_kernel_gamma }, dt, tolerance, max_dict_size, predicted_point_fx } { }
     /** Construct a new krls predictor with a given kernel.
      */
     krls_rbf_predictor(
         kernel_type && kernel,
         const core::utctimespan dt,
         const scalar_type tolerance,
-        const std::size_t max_dict_size = 1000000u
-    ) : _dt{ dt }, _krls{ std::forward<kernel_type>(kernel), tolerance, max_dict_size } { }
+        const std::size_t max_dict_size = 1000000u,
+        const ts::ts_point_fx predicted_point_fx = ts::ts_point_fx::POINT_AVERAGE_VALUE
+    ) : _dt{ dt },
+        _krls{ std::forward<kernel_type>(kernel), tolerance, max_dict_size },
+        _predicted_point_fx{ predicted_point_fx } { }
     krls_rbf_predictor(
         const kernel_type & kernel,
         const core::utctimespan dt,
         const scalar_type tolerance,
-        const std::size_t max_dict_size = 1000000u
-    ) : _dt { dt }, _krls{ kernel, tolerance, max_dict_size } { }
+        const std::size_t max_dict_size = 1000000u,
+        const ts::ts_point_fx predicted_point_fx = ts::ts_point_fx::POINT_AVERAGE_VALUE
+    ) : _dt { dt },
+        _krls{ kernel, tolerance, max_dict_size },
+        _predicted_point_fx{ predicted_point_fx } { }
     // -----
     ~krls_rbf_predictor() = default;
     // -----
@@ -68,6 +76,43 @@ public:  // con-/de-struction, move & copy
     // -----
     krls_rbf_predictor(krls_rbf_predictor &&) = default;
     krls_rbf_predictor & operator= (krls_rbf_predictor &&) = default;
+
+public:
+    /** \brief Get the scaling factor for time-values in the training and prediction methods.
+     */
+    core::utctimespan get_predictor_dt() const noexcept {
+        return this->_dt;
+    }
+    /** \brief Get the tolerance parameter from the dlib KRLS predictor.
+     */
+    scalar_type get_tolerance() const noexcept {
+        return this->_krls.tolerance();
+    }
+    /** \brief Get the currently used size of the dlib KRLS predictor dictionary.
+     */
+    std::size_t get_dictionary_size() const noexcept {
+        return this->_krls.dictionary_size();
+    }
+    /** \brief Get the maximum size of the dlib KRLS predictor dictionary.
+     */
+    std::size_t get_max_dictionary_size() const noexcept {
+        return this->_krls.max_dictionary_size();
+    }
+    /** \brief Get the gamma parameter from the radial basis kernel.
+     */
+    scalar_type get_rbf_gamma() const noexcept {
+        return this->_krls.get_kernel().gamma;
+    }
+    /** \brief Get the point interpretation policy applied to predicted time-series.
+     */
+    ts::ts_point_fx get_predicted_ts_point_policy() const noexcept {
+        return this->_predicted_point_fx;
+    }
+    /** \brief Set the point interpretation policy applied to predicted time-series.
+     */
+    void set_predicted_ts_point_policy(ts::ts_point_fx point_fx) noexcept {
+        this->_predicted_point_fx = point_fx;
+    }
 
 public:
     /** \brief Train the krls prediction algorithm on samples taken from a time-axis.
@@ -101,7 +146,6 @@ public:
         std::size_t dim = std::min(offset + count*stride, ts.size());
         krls_sample_type x;
         const scalar_type scaling_f = 1./_dt;  // compute time scaling factor
-        train_point_fx = ts.point_interpretation();
         // training iteration
         core::utctime tp;
         scalar_type pv;
@@ -174,7 +218,7 @@ public:
     TS predict(
         const TA & ta
     ) const {
-        return TS{ ta, predict_vec(ta), train_point_fx };
+        return TS{ ta, predict_vec(ta), this->_predicted_point_fx };
     }
     /** \brief Given a time-axis generate a point_ts prediction.
     *
@@ -290,6 +334,44 @@ public:
      */
     void clear() {
         _krls.clear_dictionary();
+    }
+
+
+public:
+    /**
+     */
+    std::string to_str_blob() const {
+        using namespace dlib;
+        using dlib::serialize;
+
+        std::ostringstream stream{ std::ios_base::out | std::ios_base::binary };
+        
+        int8_t point_fx_tmp = static_cast<int8_t>(this->_predicted_point_fx);
+
+        serialize(this->_dt, stream);
+        serialize(point_fx_tmp, stream);
+        serialize(this->_krls, stream);
+
+        return stream.str();
+    }
+    /**
+     */
+    static krls_rbf_predictor from_str_blob(const std::string & blob) {
+        using namespace dlib;
+        using dlib::deserialize;
+
+        krls_rbf_predictor predictor{};
+        std::istringstream stream{ blob, std::ios_base::in | std::ios_base::binary };
+
+        int8_t point_fx_tmp = 0;
+
+        deserialize(predictor._dt, stream);
+        deserialize(point_fx_tmp, stream);
+        deserialize(predictor._krls, stream);
+
+        predictor._predicted_point_fx = static_cast<ts::ts_point_fx>(point_fx_tmp);
+
+        return predictor;
     }
 
     x_serialize_decl();

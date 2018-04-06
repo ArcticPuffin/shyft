@@ -1,6 +1,7 @@
 #pragma once
 
 #include <functional>
+#include <sstream>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -8,6 +9,7 @@
 #include <boost/filesystem.hpp>
 namespace fs = boost::filesystem;
 
+#include "core/predictions.h"
 #include "core/time_series_dd.h"
 #include "time_series_info.h"
 #include "utctime_utilities.h"
@@ -34,13 +36,12 @@ namespace dtss {
  *
  *  <predictor> ::
  *      <kernel-type>     -> int32_t        # identifier for the kernel function
- *      <predictor-n>     -> uint64_t       # size in bytes of the following predictor blob
- *      <predictor-blob>
+ *      <predictor-data>
  *
- *  <predictor-blob> ::
+ *  <predictor-data> ::
  *      if <kernel-type> == krls_kernel_type_identifiers::radial_basis_kernel
- *          <gamma>       -> double         # rb function gamma parameter
- *          <predictor>                     # serialized predictor object
+ *          <predictor-n> -> uint64_t       # size in bytes of the following predictor blob
+ *          <blob>                          # serialized predictor object
  */
 
 
@@ -60,6 +61,7 @@ struct krls_ts_db_header {
         : scaling{ scaling }, tolerance{ tolerance }, t_start{ t_start }, t_end{ t_end }
     { }
 };
+// if this fails the the header can't be naively read and written to a file (i.e. memcopied)
 static_assert(std::is_trivially_copyable_v<krls_ts_db_header>,
               "\"krls_ts_db_header\" needs to be a trivially copyable type");
 
@@ -128,12 +130,37 @@ struct krls_pred_db_io {
         return kernel_type;
     }
 
-    static void read_predictor_blob(std::FILE * fh) {
-        // std::fseek(fh, read_predictor_start(fh), SEEK_SET);  // TODO skip correctly
+    static double read_predictor_rbf_gamma(std::FILE * fh) {
+        std::fseek(fh, read_predictor_start(fh) + sizeof(krls_kernel_type_identifiers), SEEK_SET);
 
-        // ...
+        double gamma_val;
+        std::fread(static_cast<void*>(&gamma_val), sizeof(double), 1, fh);
 
-        // return ???;
+        return gamma_val;
+    }
+
+    static void write_predictor_rbf_predictor(std::FILE * fh, const prediction::krls_rbf_predictor & predictor) {
+        std::fseek(fh, read_predictor_start(fh) + sizeof(krls_kernel_type_identifiers), SEEK_SET);
+
+        std::string blob = predictor.to_str_blob();
+
+        uint64_t blob_size = blob.size();
+        std::fwrite(static_cast<void*>(&blob_size), sizeof(uint64_t), 1, fh);
+        std::fwrite(static_cast<void*>(blob.data()), sizeof(char), blob_size, fh);
+
+        // TODO Figure out what serialization method to use. Especially size.
+    }
+
+    static prediction::krls_rbf_predictor read_predictor_rbf_predictor(std::FILE * fh) {
+        std::fseek(fh, read_predictor_start(fh) + sizeof(krls_kernel_type_identifiers) + sizeof(double), SEEK_SET);
+
+        uint64_t blob_size;
+        std::fread(static_cast<void*>(&blob_size), sizeof(uint64_t), 1, fh);
+
+        std::unique_ptr<char[]> blob = std::make_unique<char[]>(blob_size);
+        std::fread(static_cast<void*>(blob.get()), sizeof(char), blob_size, fh);
+
+        return prediction::krls_rbf_predictor::from_str_blob(std::string{ blob.get(), blob_size });
     }
 };
 

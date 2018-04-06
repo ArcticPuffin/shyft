@@ -250,7 +250,7 @@ inline void deserialize_helper(A & ar, dlib::krls<K> & krls) {
 
 template <class Archive>
 void shyft::prediction::krls_rbf_predictor::serialize(Archive& ar, const unsigned int file_version) {
-	ar & core_nvp("_dt", _dt) &core_nvp("train_point_fx", train_point_fx);
+	ar & core_nvp("_dt", _dt) &core_nvp("_predicted_point_fx", _predicted_point_fx);
 
 	if (Archive::is_saving::value) {
 		serialize_helper(ar, this->_krls);
