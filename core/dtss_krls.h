@@ -9,6 +9,7 @@
 #include <boost/filesystem.hpp>
 namespace fs = boost::filesystem;
 
+#include "core/dtss_mutex.h"
 #include "core/predictions.h"
 #include "core/time_series.h"
 #include "core/time_series_dd.h"
@@ -267,13 +268,66 @@ struct krls_pred_db_io {
 
 class krls_pred_db {
 
+public:
     using gta_t = shyft::time_axis::generic_dt;
     using gts_t = shyft::time_series::point_ts<gta_t>;
     using ts_vector_t = shyft::time_series::dd::ats_vector;
     using queries_t = std::map<std::string, std::string>;
 
+private:
     std::string root_dir;
     std::function<ts_vector_t(const std::string &, utcperiod, bool, bool)> server_read_cb;
+    // -----
+    file_lock_manager f_mx;
+
+private:
+    /** helper class needed for win compensating code */
+    struct close_write_handle {
+        bool win_thread_close = false;
+        mutable ts_db * parent = nullptr;
+
+        close_write_handle() noexcept {};// minimum fix for clang ref. https://stackoverflow.com/questions/43819314/default-member-initializer-needed-within-definition-of-enclosing-class-outside
+        close_write_handle(bool wtc) noexcept : win_thread_close{ wtc } {};
+        close_write_handle(const close_write_handle &) noexcept = default;
+
+        void operator()(std::FILE * fh) const {
+#ifdef _WIN32WORKAROUND
+            if (win_thread_close && parent) {
+                parent->fclose_me(fh);
+            } else {
+                std::fclose(fh); // takes forever in windows, by design
+            }
+#else
+            std::fclose(fh);
+#endif
+        }
+    };
+
+    std::map<std::string, std::shared_ptr<core::calendar>> calendars;
+
+    //--section dealing with windows and (postponing slow) closing files
+#ifdef _WIN32WORKAROUND
+    mutable mutex fclose_mx;
+    mutable std::vector<std::future<void>> fclose_windows;
+
+    void fclose_me(std::FILE *fh) {
+        lock_guard<decltype(fclose_mx)> sl(fclose_mx);
+        fclose_windows.emplace_back(std::async(std::launch::async, [fh]() { std::fclose(fh); }));
+    }
+
+    void wait_for_close_fh() const noexcept {
+        try {
+            lock_guard<decltype(fclose_mx)> scope_lock(fclose_mx);
+            for (auto& fc : fclose_windows)
+                fc.get();
+            fclose_windows.clear();
+        } catch (...) {
+
+        }
+    }
+#else
+    void wait_for_close_fh() const noexcept {}
+#endif
 
 public:
     krls_pred_db() = default;
@@ -306,25 +360,38 @@ public:
 
 public:
     void save(const std::string & fn, const gts_t & ts, bool overwrite = true, const queries_t & queries = queries_t{}, bool win_thread_close = true) const {
+        wait_for_close_fh();
+        auto ffp = make_full_path(fn);
+        writer_file_lock lck(f_mx, ffp);
         // only ts_id -> lookup from server
         // ts_id and data -> train on data first, then check server for more
     }
 
     gts_t read(const std::string & fn, core::utcperiod p, const queries_t & queries = queries_t{}) const {
+        wait_for_close_fh();
+        auto ffp = make_full_path(fn);
+        reader_file_lock lck(f_mx, ffp);
         // TODO
         return gts_t{};
     }
 
     void remove(const std::string & fn, const queries_t & queries = queries_t{}) const {
+        wait_for_close_fh();
+        auto ffp = make_full_path(fn);
+        writer_file_lock lck(f_mx, ffp);
         // TODO
     }
 
     ts_info get_ts_info(const std::string & fn, const queries_t & queries = queries_t{}) const {
+        wait_for_close_fh();
+        auto ffp = make_full_path(fn);
+        reader_file_lock lck(f_mx, ffp);
         // TODO
         return ts_info{};
     }
 
     std::vector<ts_info> find(const std::string & match, const queries_t & queries = queries_t{}) const {
+        wait_for_close_fh();
         // TODO
         return std::vector<ts_info>{};
     };
@@ -333,8 +400,40 @@ public:
     /*  Internal implementation
      * ========================= */
 
-// private:
-
+private:
+    bool save_path_exists(const std::string & fn) const {
+        fs::path fn_path{ fn }, root_path{ root_dir };
+        if (fn_path.is_relative()) {
+            fn_path = root_path / fn_path;
+        } else {
+            // questionable: should we allow outside container specs?
+            // return false;
+        }
+        return fs::is_regular_file(fn_path);
+    }
+    std::string make_full_path(const std::string& fn, bool create_paths = false) const {
+        fs::path fn_path{ fn }, root_path{ root_dir };
+        // determine path type
+        if (fn_path.is_relative()) {
+            fn_path = root_path / fn_path;
+        } else {  // fn_path.is_absolute()
+                  // questionable: should we allow outside container specs?
+                  //  - if determined to be fully allowed: remove this branch or throw
+        }
+        // not a directory and create missing path
+        if (fs::is_directory(fn_path)) {
+            throw std::runtime_error(fn_path.string() + " is a directory. Should be a file.");
+        } else if (!fs::exists(fn_path) && create_paths) {
+            fs::path rp = fn_path.parent_path();
+            if (rp.compare(root_path) > 0) {  // if fn contains sub-directory, we have to check that it exits
+                if (!fs::is_directory(rp)) {
+                    fs::create_directories(rp);
+                }
+            }
+        }
+        // -----
+        return fn_path.string();
+    }
 
 };
 
