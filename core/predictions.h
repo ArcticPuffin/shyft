@@ -340,11 +340,11 @@ public:
 public:
     /**
      */
-    std::string to_str_blob() const {
+    std::basic_string<char> to_str_blob() const {
         using namespace dlib;
         using dlib::serialize;
 
-        std::ostringstream stream{ std::ios_base::out | std::ios_base::binary };
+        std::basic_ostringstream<char> stream{ std::ios_base::out | std::ios_base::binary };
         
         int8_t point_fx_tmp = static_cast<int8_t>(this->_predicted_point_fx);
 
@@ -356,12 +356,12 @@ public:
     }
     /**
      */
-    static krls_rbf_predictor from_str_blob(const std::string & blob) {
+    static krls_rbf_predictor from_str_blob(const std::basic_string<char> & blob) {
         using namespace dlib;
         using dlib::deserialize;
 
         krls_rbf_predictor predictor{};
-        std::istringstream stream{ blob, std::ios_base::in | std::ios_base::binary };
+        std::basic_istringstream<char> stream{ blob, std::ios_base::in | std::ios_base::binary };
 
         int8_t point_fx_tmp = 0;
 
