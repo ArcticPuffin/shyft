@@ -29,8 +29,11 @@ namespace ts = shyft::time_series;
  *  <krls.ts.db.file> ::
  *      "KRLS.TS.DB.0001" '\0'                  # format identifier and version, null terminated
  *      <header-start>          -> uint64_t     # number of bytes from the beginning of the file to <krls-header>
+ *      <source-start>          -> uint64_t     # number of bytes from the beginning of the file to <source-url-n>
  *      <predictor-start>       -> uint64_t     # number of bytes from the beginning of the file to <predictor>
- *      <krls-header>                           # krls generic header block 
+ *      <krls-header>                           # krls generic header block
+ *      <source-url-n>          -> uint64_t     # length in bytes (char) of <source-url>
+ *      <source-url>            -> char[n]      # source url the krls is trained on
  *      <predictor>                             # serialized predictor object
  *
  *  <krls-header> ::
@@ -47,11 +50,11 @@ namespace ts = shyft::time_series;
  *      <kernel-type>           -> int32_t      # identifier for the kernel function
  *      <kernel-header>                         # kernel specific header, type depends on <predictor-type>
  *      <predictor-n>           -> uint64_t     # size in bytes of the following predictor blob
- *      <blob>                                  # serialized predictor object
+ *      <blob>                  -> char[n]      # serialized predictor object
  *
- *  <predictor-header> ::
+ *  <kernel-header> ::
  *      if <predictor-type> == krls_kernel_type_identifiers::radial_basis_kernel
- *          <rbf-gamma>           -> double     # gamma value for a radial basis function kernel
+ *          <rbf-gamma>         -> double       # gamma value for a radial basis function kernel
  *
  */
 
@@ -98,11 +101,57 @@ struct krls_pred_db_io {
         'K', 'R', 'L', 'S', '.', 'T', 'S', '.', 'D', 'B', '.', '0', '0', '0', '1', '\0'
     };
 
+    /*  utility
+     * ========= */
+
+    static prediction::krls_rbf_predictor create_rbf_file(
+        std::FILE * fh,
+        const std::string & source_url,  // series filename and source url
+        const core::utcperiod & period,  // period to train
+        const core::utctimespan dt, const ts::ts_point_fx point_fx,
+        const std::size_t dict_size, const double tolerance,  // general krls parameters
+        const double gamma  // rbf kernel parameters
+    ) {
+        std::fseek(fh, 0, SEEK_SET);
+
+        const krls_kernel_type_identifiers kernel_id = krls_kernel_type_identifiers::radial_basis_kernel;
+        const krls_ts_db_generic_header generic_header{ dt, tolerance, point_fx, period.start, period.end };
+        const krls_ts_db_rbf_header rbf_kernel_header{ gamma };
+        prediction::krls_rbf_predictor predictor{};
+
+        // file identifier
+        std::fwrite(static_cast<const void*>(file_id.data()), sizeof(char), file_id.size(), fh);
+
+        // header data
+        write_header_start(fh, file_id.size()*sizeof(char) + 3*sizeof(std::uint64_t), true);
+        write_header(fh, generic_header, true);
+
+        // source url data
+        write_source_url_start(fh, file_id.size()*sizeof(char) + 3*sizeof(std::uint64_t) + sizeof(krls_ts_db_generic_header), true);
+        write_source_url(fh, source_url, true);
+
+        // predictor data
+        const std::uint64_t predictor_start = std::ftell(fh);
+        // -----
+        write_predictor_start(fh, predictor_start, true);
+        // -----
+        write_predictor_kernel_type_start(fh, predictor_start + 3*sizeof(std::uint64_t), true);
+        write_predictor_kernel_header_start(fh, predictor_start + 3*sizeof(std::uint64_t) + sizeof(int32_t), true);
+        write_predictor_blob_start(fh, predictor_start + 3*sizeof(std::uint64_t) + sizeof(int32_t) + sizeof(krls_ts_db_rbf_header), true);
+        // -----
+        std::fwrite(static_cast<const void *>(&kernel_id), sizeof(krls_kernel_type_identifiers), 1, fh);
+        write_predictor_rbf_header(fh, rbf_kernel_header, true);
+        write_predictor_rbf_predictor(fh, predictor, true);
+
+        return predictor;
+    }
+
     /*  pre-header data
      * ================= */
 
-    inline static bool can_read_file(std::FILE * fh) {
-        std::fseek(fh, 0, SEEK_SET);
+    inline static bool can_read_file(std::FILE * fh, bool skip = true) {
+        if ( skip )
+            std::fseek(fh, 0, SEEK_SET);
 
         std::remove_const_t<decltype(file_id)> data;  // ensure the type matches the header we are looking for
         std::fread(static_cast<void *>(data.data()), sizeof(char), file_id.size(), fh);
@@ -112,13 +161,15 @@ struct krls_pred_db_io {
 
     // --------------------
 
-    inline static void write_header_start(std::FILE * fh, const std::uint64_t start_val) {
-        std::fseek(fh, file_id.size()*sizeof(char), SEEK_SET);
+    inline static void write_header_start(std::FILE * fh, const std::uint64_t start_val, bool skip = true) {
+        if ( skip )
+            std::fseek(fh, file_id.size()*sizeof(char), SEEK_SET);
 
         std::fwrite(static_cast<const void*>(&start_val), sizeof(std::uint64_t), 1, fh);
     }
-    inline static std::uint64_t read_header_start(std::FILE * fh) {
-        std::fseek(fh, file_id.size()*sizeof(char), SEEK_SET);
+    inline static std::uint64_t read_header_start(std::FILE * fh, bool skip = true) {
+        if ( skip )
+            std::fseek(fh, file_id.size()*sizeof(char), SEEK_SET);
 
         std::uint64_t skip_val;
         std::fread(static_cast<void*>(&skip_val), sizeof(std::uint64_t), 1, fh);
@@ -128,13 +179,33 @@ struct krls_pred_db_io {
 
     // --------------------
 
-    inline static void write_predictor_start(std::FILE * fh, const std::uint64_t start_val) {
-        std::fseek(fh, file_id.size()*sizeof(char) + sizeof(std::uint64_t), SEEK_SET);
+    inline static void write_source_url_start(std::FILE * fh, const std::uint64_t start_val, bool skip = true) {
+        if ( skip )
+            std::fseek(fh, file_id.size()*sizeof(char) + 1*sizeof(std::uint64_t), SEEK_SET);
 
         std::fwrite(static_cast<const void*>(&start_val), sizeof(std::uint64_t), 1, fh);
     }
-    inline static std::uint64_t read_predictor_start(std::FILE * fh) {
-        std::fseek(fh, file_id.size()*sizeof(char) + sizeof(std::uint64_t), SEEK_SET);
+    inline static std::uint64_t read_source_url_start(std::FILE * fh, bool skip = true) {
+        if ( skip )
+            std::fseek(fh, file_id.size()*sizeof(char) + 1*sizeof(std::uint64_t), SEEK_SET);
+
+        std::uint64_t skip_val;
+        std::fread(static_cast<void*>(&skip_val), sizeof(std::uint64_t), 1, fh);
+
+        return skip_val;
+    }
+
+    // --------------------
+
+    inline static void write_predictor_start(std::FILE * fh, const std::uint64_t start_val, bool skip = true) {
+        if ( skip )
+            std::fseek(fh, file_id.size()*sizeof(char) + 2*sizeof(std::uint64_t), SEEK_SET);
+
+        std::fwrite(static_cast<const void*>(&start_val), sizeof(std::uint64_t), 1, fh);
+    }
+    inline static std::uint64_t read_predictor_start(std::FILE * fh, bool skip = true) {
+        if ( skip )
+            std::fseek(fh, file_id.size()*sizeof(char) + 2*sizeof(std::uint64_t), SEEK_SET);
 
         std::uint64_t skip_val;
         std::fread(static_cast<void*>(&skip_val), sizeof(std::uint64_t), 1, fh);
@@ -145,13 +216,15 @@ struct krls_pred_db_io {
     /*  header data
      * ============= */
 
-    inline static void write_header(std::FILE * fh, const krls_ts_db_generic_header header) {
-        std::fseek(fh, read_header_start(fh)*sizeof(char), SEEK_SET);
+    inline static void write_header(std::FILE * fh, const krls_ts_db_generic_header header, bool skip = true) {
+        if ( skip )
+            std::fseek(fh, read_header_start(fh)*sizeof(char), SEEK_SET);
 
         std::fwrite(static_cast<const void*>(&header), sizeof(krls_ts_db_generic_header), 1, fh);
     }
-    inline static krls_ts_db_generic_header read_header(std::FILE * fh) {
-        std::fseek(fh, read_header_start(fh)*sizeof(char), SEEK_SET);
+    inline static krls_ts_db_generic_header read_header(std::FILE * fh, bool skip = true) {
+        if ( skip )
+            std::fseek(fh, read_header_start(fh)*sizeof(char), SEEK_SET);
 
         krls_ts_db_generic_header header;
         std::fread(static_cast<void*>(&header), sizeof(krls_ts_db_generic_header), 1, fh);
@@ -159,16 +232,41 @@ struct krls_pred_db_io {
         return header;
     }
 
+    // --------------------
+
+    inline static std::string write_source_url(std::FILE * fh, std::string url, bool skip = true) {
+        if ( skip )
+            std::fseek(fh, read_source_url_start(fh)*sizeof(char), SEEK_SET);
+
+        std::uint64_t source_n = url.size();
+        std::fwrite(static_cast<void*>(&source_n), sizeof(std::uint64_t), 1, fh);
+        std::fwrite(static_cast<void*>(url.data()), sizeof(char), source_n, fh);
+    }
+    inline static std::string read_source_url(std::FILE * fh, bool skip = true) {
+        if ( skip )
+            std::fseek(fh, read_source_url_start(fh)*sizeof(char), SEEK_SET);
+
+        std::uint64_t source_n;
+        std::fread(static_cast<void*>(&source_n), sizeof(std::uint64_t), 1, fh);
+
+        auto tmp_data = std::make_unique<char[]>(source_n);
+        std::fread(static_cast<void*>(tmp_data.get()), sizeof(char), source_n, fh);
+
+        return std::string{ tmp_data.get(), source_n };
+    }
+
     /*  general predictor data
      * ======================== */
 
-    inline static void write_predictor_kernel_type_start(std::FILE * fh, const std::uint64_t start_val) {
-        std::fseek(fh, read_predictor_start(fh)*sizeof(char), SEEK_SET);
+    inline static void write_predictor_kernel_type_start(std::FILE * fh, const std::uint64_t start_val, bool skip = true) {
+        if ( skip )
+            std::fseek(fh, read_predictor_start(fh)*sizeof(char), SEEK_SET);
 
         std::fwrite(static_cast<const void*>(&start_val), sizeof(std::uint64_t), 1, fh);
     }
-    inline static std::uint64_t read_predictor_kernel_type_start(std::FILE * fh) {
-        std::fseek(fh, read_predictor_start(fh)*sizeof(char), SEEK_SET);
+    inline static std::uint64_t read_predictor_kernel_type_start(std::FILE * fh, bool skip = true) {
+        if ( skip )
+            std::fseek(fh, read_predictor_start(fh)*sizeof(char), SEEK_SET);
 
         std::uint64_t skip_val;
         std::fread(static_cast<void*>(&skip_val), sizeof(std::uint64_t), 1, fh);
@@ -178,13 +276,15 @@ struct krls_pred_db_io {
 
     // --------------------
 
-    inline static void write_predictor_kernel_header_start(std::FILE * fh, const std::uint64_t start_val) {
-        std::fseek(fh, read_predictor_start(fh)*sizeof(char) + 1*sizeof(std::uint64_t), SEEK_SET);
+    inline static void write_predictor_kernel_header_start(std::FILE * fh, const std::uint64_t start_val, bool skip = true) {
+        if ( skip )
+            std::fseek(fh, read_predictor_start(fh)*sizeof(char) + 1*sizeof(std::uint64_t), SEEK_SET);
 
         std::fwrite(static_cast<const void*>(&start_val), sizeof(std::uint64_t), 1, fh);
     }
-    inline static std::uint64_t read_predictor_kernel_header_start(std::FILE * fh) {
-        std::fseek(fh, read_predictor_start(fh)*sizeof(char) + 1*sizeof(std::uint64_t), SEEK_SET);
+    inline static std::uint64_t read_predictor_kernel_header_start(std::FILE * fh, bool skip = true) {
+        if ( skip )
+            std::fseek(fh, read_predictor_start(fh)*sizeof(char) + 1*sizeof(std::uint64_t), SEEK_SET);
 
         std::uint64_t skip_val;
         std::fread(static_cast<void*>(&skip_val), sizeof(std::uint64_t), 1, fh);
@@ -194,13 +294,15 @@ struct krls_pred_db_io {
 
     // --------------------
 
-    inline static void write_predictor_blob_start(std::FILE * fh, const std::uint64_t start_val) {
-        std::fseek(fh, read_predictor_start(fh)*sizeof(char) + 2*sizeof(std::uint64_t), SEEK_SET);
+    inline static void write_predictor_blob_start(std::FILE * fh, const std::uint64_t start_val, bool skip = true) {
+        if ( skip )
+            std::fseek(fh, read_predictor_start(fh)*sizeof(char) + 2*sizeof(std::uint64_t), SEEK_SET);
 
         std::fwrite(static_cast<const void*>(&start_val), sizeof(std::uint64_t), 1, fh);
     }
-    inline static std::uint64_t read_predictor_blob_start(std::FILE * fh) {
-        std::fseek(fh, read_predictor_start(fh)*sizeof(char) + 2*sizeof(std::uint64_t), SEEK_SET);
+    inline static std::uint64_t read_predictor_blob_start(std::FILE * fh, bool skip = true) {
+        if ( skip )
+            std::fseek(fh, read_predictor_start(fh)*sizeof(char) + 2*sizeof(std::uint64_t), SEEK_SET);
 
         std::uint64_t skip_val;
         std::fread(static_cast<void*>(&skip_val), sizeof(std::uint64_t), 1, fh);
@@ -210,13 +312,15 @@ struct krls_pred_db_io {
 
     // --------------------
 
-    static void write_predictor_kernel_type(std::FILE * fh, const krls_kernel_type_identifiers kernel_type) {
-        std::fseek(fh, read_predictor_kernel_type_start(fh)*sizeof(char), SEEK_SET);
+    static void write_predictor_kernel_type(std::FILE * fh, const krls_kernel_type_identifiers kernel_type, bool skip = true) {
+        if ( skip )
+            std::fseek(fh, read_predictor_kernel_type_start(fh)*sizeof(char), SEEK_SET);
 
         std::fwrite(static_cast<const void*>(&kernel_type), sizeof(krls_kernel_type_identifiers), 1, fh);
     }
-    static krls_kernel_type_identifiers read_predictor_kernel_type(std::FILE * fh) {
-        std::fseek(fh, read_predictor_kernel_type_start(fh)*sizeof(char), SEEK_SET);
+    static krls_kernel_type_identifiers read_predictor_kernel_type(std::FILE * fh, bool skip = true) {
+        if ( skip )
+            std::fseek(fh, read_predictor_kernel_type_start(fh)*sizeof(char), SEEK_SET);
 
         krls_kernel_type_identifiers kernel_type;
         std::fread(static_cast<void*>(&kernel_type), sizeof(krls_kernel_type_identifiers), 1, fh);
@@ -227,13 +331,15 @@ struct krls_pred_db_io {
     /*  radial basis predictor data
      * ============================= */
 
-    static void write_predictor_rbf_header(std::FILE * fh, const krls_ts_db_rbf_header kernel_type) {
-        std::fseek(fh, read_predictor_kernel_header_start(fh)*sizeof(char), SEEK_SET);
+    static void write_predictor_rbf_header(std::FILE * fh, const krls_ts_db_rbf_header kernel_type, bool skip = true) {
+        if ( skip )
+            std::fseek(fh, read_predictor_kernel_header_start(fh)*sizeof(char), SEEK_SET);
 
         std::fwrite(static_cast<const void*>(&kernel_type), sizeof(krls_ts_db_rbf_header), 1, fh);
     }
-    static krls_ts_db_rbf_header read_predictor_rbf_header(std::FILE * fh) {
-        std::fseek(fh, read_predictor_kernel_header_start(fh)*sizeof(char), SEEK_SET);
+    static krls_ts_db_rbf_header read_predictor_rbf_header(std::FILE * fh, bool skip = true) {
+        if ( skip )
+            std::fseek(fh, read_predictor_kernel_header_start(fh)*sizeof(char), SEEK_SET);
 
         krls_ts_db_rbf_header kernel_header;
         std::fread(static_cast<void*>(&kernel_header), sizeof(krls_ts_db_rbf_header), 1, fh);
@@ -243,8 +349,9 @@ struct krls_pred_db_io {
 
     // --------------------
 
-    static void write_predictor_rbf_predictor(std::FILE * fh, const prediction::krls_rbf_predictor & predictor) {
-        std::fseek(fh, read_predictor_start(fh) + sizeof(krls_kernel_type_identifiers), SEEK_SET);
+    static void write_predictor_rbf_predictor(std::FILE * fh, const prediction::krls_rbf_predictor & predictor, bool skip = true) {
+        if ( skip )
+            std::fseek(fh, read_predictor_start(fh) + sizeof(krls_kernel_type_identifiers), SEEK_SET);
 
         std::basic_string<char> blob = predictor.to_str_blob();
 
@@ -252,8 +359,9 @@ struct krls_pred_db_io {
         std::fwrite(static_cast<void*>(&blob_size), sizeof(uint64_t), 1, fh);
         std::fwrite(static_cast<void*>(blob.data()), sizeof(char), blob_size, fh);
     }
-    static prediction::krls_rbf_predictor read_predictor_rbf_predictor(std::FILE * fh) {
-        std::fseek(fh, read_predictor_start(fh) + sizeof(krls_kernel_type_identifiers), SEEK_SET);
+    static prediction::krls_rbf_predictor read_predictor_rbf_predictor(std::FILE * fh, bool skip = true) {
+        if ( skip )
+            std::fseek(fh, read_predictor_start(fh) + sizeof(krls_kernel_type_identifiers), SEEK_SET);
 
         uint64_t blob_size;
         std::fread(static_cast<void*>(&blob_size), sizeof(uint64_t), 1, fh);
@@ -284,7 +392,7 @@ private:
     /** helper class needed for win compensating code */
     struct close_write_handle {
         bool win_thread_close = false;
-        mutable ts_db * parent = nullptr;
+        mutable krls_pred_db * parent = nullptr;
 
         close_write_handle() noexcept {};// minimum fix for clang ref. https://stackoverflow.com/questions/43819314/default-member-initializer-needed-within-definition-of-enclosing-class-outside
         close_write_handle(bool wtc) noexcept : win_thread_close{ wtc } {};
@@ -302,8 +410,6 @@ private:
 #endif
         }
     };
-
-    std::map<std::string, std::shared_ptr<core::calendar>> calendars;
 
     //--section dealing with windows and (postponing slow) closing files
 #ifdef _WIN32WORKAROUND
@@ -359,30 +465,47 @@ public:
      * =============== */
 
 public:
-    void save(const std::string & fn, const gts_t & ts, bool overwrite = true, const queries_t & queries = queries_t{}, bool win_thread_close = true) const {
+    void save(const std::string & fn, const gts_t & ts, bool overwrite = true, const queries_t & queries = queries_t{}, bool win_thread_close = true) {
+        // request access
         wait_for_close_fh();
         auto ffp = make_full_path(fn);
         writer_file_lock lck(f_mx, ffp);
-        // only ts_id -> lookup from server
-        // ts_id and data -> train on data first, then check server for more
+
+        // only ts_id -> lookup from server ???
+        // ts_id and data -> train on data first, then check server for more ???
+
+        // TODO: dispatch to `register_rbf_series`, get period from `ts` and arguments from `queries`
+        //       Use the same fn/id to construct the source?
+        //       What about defaults?
     }
 
-    gts_t read(const std::string & fn, core::utcperiod p, const queries_t & queries = queries_t{}) const {
-        wait_for_close_fh();
-        auto ffp = make_full_path(fn);
-        reader_file_lock lck(f_mx, ffp);
-        // TODO
-        return gts_t{};
+    gts_t read(const std::string & fn, core::utcperiod period, const queries_t & queries = queries_t{}) {
+        // determine time-step
+        core::utctimespan dt = core::calendar::HOUR;
+        auto it = queries.find("dt");
+        if ( it != queries.cend() ) {
+            try {
+                dt = std::stol(it->second);
+            } catch ( const std::invalid_argument & ) {
+                throw std::runtime_error(std::string{"krls_pred_db: cannot parse time-step: "}+it->second);
+            }
+        }
+        // compute steps
+        std::size_t n = (period.end - period.start)/dt;
+        if ( period.start + n*dt < period.start )
+            n += 1;
+
+        return this->predict_time_series(fn, gta_t{ period.start, dt, n });
     }
 
-    void remove(const std::string & fn, const queries_t & queries = queries_t{}) const {
+    void remove(const std::string & fn, const queries_t & queries = queries_t{}) {
         wait_for_close_fh();
         auto ffp = make_full_path(fn);
         writer_file_lock lck(f_mx, ffp);
         // TODO
     }
 
-    ts_info get_ts_info(const std::string & fn, const queries_t & queries = queries_t{}) const {
+    ts_info get_ts_info(const std::string & fn, const queries_t & queries = queries_t{}) {
         wait_for_close_fh();
         auto ffp = make_full_path(fn);
         reader_file_lock lck(f_mx, ffp);
@@ -390,12 +513,80 @@ public:
         return ts_info{};
     }
 
-    std::vector<ts_info> find(const std::string & match, const queries_t & queries = queries_t{}) const {
+    std::vector<ts_info> find(const std::string & match, const queries_t & queries = queries_t{}) {
         wait_for_close_fh();
         // TODO
         return std::vector<ts_info>{};
     };
 
+    /*  KRLS container API
+     * ==================== */
+
+public:
+    void register_rbf_series(
+        const std::string & fn, const std::string & source_url,  // series filename and source url
+        const core::utcperiod & period,  // period to train
+        const core::utctimespan dt, const ts::ts_point_fx point_fx,
+        const std::size_t dict_size, const double tolerance,  // general parameters
+        const double gamma,  // rbf kernel parameters
+        const bool win_thread_close = true
+    ) {
+        // request exclusive access
+        wait_for_close_fh();
+        auto ffp = make_full_path(fn);
+        writer_file_lock lck(f_mx, ffp);
+        // setup file pointer
+        std::unique_ptr<std::FILE, close_write_handle> fh;  // zero-initializes deleter
+        fh.get_deleter().win_thread_close = win_thread_close;
+        fh.get_deleter().parent = const_cast<krls_pred_db*>(this);
+
+        if ( ! save_path_exists(fn) ) {
+            // open for binary read/write, destroy any contents
+            fh.reset(std::fopen(ffp.c_str(), "w+b"));
+            // setup datafile and create predictor
+            prediction::krls_rbf_predictor predictor = krls_pred_db_io::create_rbf_file(fh.get(),
+                source_url, period, dt, point_fx, dict_size, tolerance, gamma);
+            // train on data available using the source url
+            this->train_on_period(predictor, period, source_url);
+            // write the trained predictor
+            krls_pred_db_io::write_predictor_rbf_predictor(fh.get(), predictor);
+        } else {
+            throw std::runtime_error(std::string{"krls_pred_db: series already registered: "} + fn);
+        }
+    }
+
+    gts_t predict_time_series(
+        const std::string & fn,
+        const gta_t & ta
+    ) {
+        // request shared access
+        wait_for_close_fh();
+        auto ffp = make_full_path(fn);
+        reader_file_lock lck(f_mx, ffp);
+
+        if ( save_path_exists(fn) ) {
+            // setup file pointer
+            std::unique_ptr<std::FILE, decltype(&std::fclose)> fh{ std::fopen(ffp.c_str(), "rb"), &std::fclose };
+
+            if ( krls_pred_db_io::can_read_file(fh.get()) ) {
+                const krls_kernel_type_identifiers kernel_type = krls_pred_db_io::read_predictor_kernel_type(fh.get());
+                switch ( kernel_type ) {
+
+                case krls_kernel_type_identifiers::radial_basis_kernel: {
+                    prediction::krls_rbf_predictor predictor = krls_pred_db_io::read_predictor_rbf_predictor(fh.get());
+                    return predictor.predict<gts_t, gta_t>(ta);
+                }
+
+                default:
+                    throw std::runtime_error(std::string{"krls_pred_db: unknown kernel identifier"});
+                }
+            } else {
+                throw std::runtime_error(std::string{"krls_pred_db: cannot read, unknown data format: "}+fn);
+            }
+        } else {
+            throw std::runtime_error(std::string{"krls_pred_db: no data for id: "}+fn);
+        }
+    }
 
     /*  Internal implementation
      * ========================= */
@@ -403,11 +594,12 @@ public:
 private:
     bool save_path_exists(const std::string & fn) const {
         fs::path fn_path{ fn }, root_path{ root_dir };
-        if (fn_path.is_relative()) {
+        if ( fn_path.is_relative() ) {
             fn_path = root_path / fn_path;
-        } else {
+        } else {  /* fn_path.is_absolute() */
             // questionable: should we allow outside container specs?
-            // return false;
+            //  - if determined determined to be allowed: remove this branch
+            throw std::runtime_error("krls_pred_db: outside container spec not allowed");
         }
         return fs::is_regular_file(fn_path);
     }
@@ -416,13 +608,14 @@ private:
         // determine path type
         if (fn_path.is_relative()) {
             fn_path = root_path / fn_path;
-        } else {  // fn_path.is_absolute()
-                  // questionable: should we allow outside container specs?
-                  //  - if determined to be fully allowed: remove this branch or throw
+        } else {  /* fn_path.is_absolute() */
+            // questionable: should we allow outside container specs?
+            //  - if determined determined to be allowed: remove this branch
+            throw std::runtime_error("krls_pred_db: outside container spec not allowed");
         }
         // not a directory and create missing path
         if (fs::is_directory(fn_path)) {
-            throw std::runtime_error(fn_path.string() + " is a directory. Should be a file.");
+            throw std::runtime_error(std::string{"krls_pred_db: "}+fn_path.string()+" is a directory. Should be a file.");
         } else if (!fs::exists(fn_path) && create_paths) {
             fs::path rp = fn_path.parent_path();
             if (rp.compare(root_path) > 0) {  // if fn contains sub-directory, we have to check that it exits
@@ -433,6 +626,24 @@ private:
         }
         // -----
         return fn_path.string();
+    }
+
+    // --------------------
+
+    void train_on_period(
+        prediction::krls_rbf_predictor & predictor,
+        const core::utcperiod & period,
+        const std::string & source_url
+    ) {
+        ts_vector_t vec = this->server_read_cb(source_url, period, false, false);
+
+        if ( vec.size() > 0 ) {
+            for ( auto && ts : vec ) {
+                predictor.train(ts);
+            }
+        } else {
+            throw std::runtime_error(std::string{"krls_pred_db: no time-series at url: "} + source_url);
+        }
     }
 
 };
