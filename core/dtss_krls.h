@@ -10,6 +10,7 @@
 namespace fs = boost::filesystem;
 
 #include "core/dtss_mutex.h"
+#include "core/dtss_url.h"
 #include "core/predictions.h"
 #include "core/time_series.h"
 #include "core/time_series_dd.h"
@@ -234,7 +235,7 @@ struct krls_pred_db_io {
 
     // --------------------
 
-    inline static std::string write_source_url(std::FILE * fh, std::string url, bool skip = true) {
+    inline static void write_source_url(std::FILE * fh, std::string url, bool skip = true) {
         if ( skip )
             std::fseek(fh, read_source_url_start(fh)*sizeof(char), SEEK_SET);
 
@@ -449,9 +450,9 @@ public:
                 if ( ! fs::create_directories(root_dir) ) {
                     throw std::runtime_error(std::string{"krls_pred_db: failed to create root directory: "} + root_dir);
                 }
+            } else {
+                throw std::runtime_error(std::string{"krls_pred_db: designated root directory is not a directory: "} + root_dir);
             }
-        } else {
-            throw std::runtime_error(std::string{"krls_pred_db: designated root directory is not a directory: "} + root_dir);
         }
     }
 
@@ -466,17 +467,54 @@ public:
 
 public:
     void save(const std::string & fn, const gts_t & ts, bool overwrite = true, const queries_t & queries = queries_t{}, bool win_thread_close = true) {
-        // request access
-        wait_for_close_fh();
-        auto ffp = make_full_path(fn);
-        writer_file_lock lck(f_mx, ffp);
+        // // request access
+        // wait_for_close_fh();
+        // auto ffp = make_full_path(fn);
+        // writer_file_lock lck(f_mx, ffp);
 
-        // only ts_id -> lookup from server ???
-        // ts_id and data -> train on data first, then check server for more ???
+        std::string source_url;
+        if ( auto it = queries.find("source_url"); it != queries.cend() ) {
+            source_url = it->second;
+        } else {
+            throw std::runtime_error("krls_pred_db: no source url in query parameters");
+        }
 
-        // TODO: dispatch to `register_rbf_series`, get period from `ts` and arguments from `queries`
-        //       Use the same fn/id to construct the source?
-        //       What about defaults?
+        core::utcperiod period = ts.total_period();
+
+        core::utctimespan dt_scaling;
+        if ( auto it = queries.find("dt_scaling"); it != queries.cend() ) {
+            dt_scaling = std::stoll(it->second);
+        } else {
+            throw std::runtime_error("krls_pred_db: no time scaling (dt_scaling) in query parameters");
+        }
+
+        ts::ts_point_fx point_fx = ts::ts_point_fx::POINT_AVERAGE_VALUE;
+        if ( auto it = queries.find("point_fx"); it != queries.cend() ) {
+            if ( it->second == "average" ) {
+                point_fx = ts::ts_point_fx::POINT_AVERAGE_VALUE;
+            } else if ( it->second == "average" ) {
+                point_fx = ts::ts_point_fx::POINT_INSTANT_VALUE;
+            } else {
+                throw std::runtime_error(std::string{"krls_pred_db: unknown point interpretation: "}+it->second);
+            }
+        }
+
+        std::size_t krls_dict_size = 10000000u;
+        if ( auto it = queries.find("krls_dict_size"); it != queries.cend() ) {
+            krls_dict_size = std::stoul(it->second);
+        }
+
+        double tolerance = 0.001;
+        if ( auto it = queries.find("tolerance"); it != queries.cend() ) {
+            tolerance = std::stod(it->second);
+        }
+
+        double gamma = 0.001;
+        if ( auto it = queries.find("gamma"); it != queries.cend() ) {
+            gamma = std::stod(it->second);
+        }
+
+        this->register_rbf_series(fn, source_url, period, dt_scaling, point_fx, krls_dict_size, tolerance, gamma, win_thread_close);
     }
 
     gts_t read(const std::string & fn, core::utcperiod period, const queries_t & queries = queries_t{}) {
@@ -491,11 +529,11 @@ public:
             }
         }
         // compute steps
-        std::size_t n = (period.end - period.start)/dt;
-        if ( period.start + n*dt < period.start )
+        std::int64_t n = (period.end - period.start)/dt;
+        if ( period.start + n*dt < period.end )
             n += 1;
 
-        return this->predict_time_series(fn, gta_t{ period.start, dt, n });
+        return this->predict_time_series(fn, gta_t{ period.start, dt, static_cast<std::size_t>(n) });
     }
 
     void remove(const std::string & fn, const queries_t & queries = queries_t{}) {
@@ -578,7 +616,7 @@ public:
                 }
 
                 default:
-                    throw std::runtime_error(std::string{"krls_pred_db: unknown kernel identifier"});
+                    throw std::runtime_error(std::string{"krls_pred_db: unknown kernel identifier: "} + std::to_string(static_cast<std::int32_t>(kernel_type)));
                 }
             } else {
                 throw std::runtime_error(std::string{"krls_pred_db: cannot read, unknown data format: "}+fn);
